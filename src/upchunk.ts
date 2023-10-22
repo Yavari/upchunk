@@ -1,8 +1,9 @@
-import { EventTarget, Event } from 'event-target-shim';
 import xhr from 'xhr';
 // NOTE: Need duplicate imports for Typescript version compatibility reasons (CJP)
 /* tslint:disable-next-line no-duplicate-imports */
 import type { XhrUrlConfig, XhrHeaders, XhrResponse } from 'xhr';
+
+import { EventDispatcher, EventName } from './EventDispatcher'
 
 const DEFAULT_CHUNK_SIZE = 30720;
 const DEFAULT_MAX_CHUNK_SIZE = 512000; // in kB
@@ -169,20 +170,6 @@ const isFailedChunkUpload = (
   );
 };
 
-type EventName =
-  | 'attempt'
-  | 'attemptFailure'
-  | 'chunkSuccess'
-  | 'error'
-  | 'offline'
-  | 'online'
-  | 'progress'
-  | 'success';
-
-// NOTE: This and the EventTarget definition below could be more precise
-// by e.g. typing the detail of the CustomEvent per EventName.
-type UpchunkEvent = CustomEvent & Event<EventName>;
-
 type AllowedMethods = 'PUT' | 'POST' | 'PATCH';
 
 export interface UpChunkOptions {
@@ -228,8 +215,9 @@ export class UpChunk {
   private currentXhr?: XMLHttpRequest;
   private lastChunkStart: Date;
   private nextChunkRangeStart: number;
+  private eventDispatcher: EventDispatcher;
 
-  private eventTarget: EventTarget<Record<EventName, UpchunkEvent>>;
+
 
   constructor(options: UpChunkOptions) {
     this.endpoint = options.endpoint;
@@ -249,6 +237,7 @@ export class UpChunk {
     this._paused = false;
     this.success = false;
     this.nextChunkRangeStart = 0;
+    this.eventDispatcher = new EventDispatcher();
 
     // Types appear to be getting confused in env setup, using the overloaded NodeJS Blob definition, which uses NodeJS.ReadableStream instead
     // of the DOM type definitions. For definitions, See consumers.d.ts vs. lib.dom.d.ts. (CJP)
@@ -260,8 +249,6 @@ export class UpChunk {
       this.chunkedStreamIterable[Symbol.asyncIterator]();
 
     this.totalChunks = Math.ceil(this.file.size / this.chunkByteSize);
-
-    this.eventTarget = new EventTarget();
 
     this.validateOptions();
     this.getEndpoint().then(() => this.sendChunks());
@@ -275,13 +262,13 @@ export class UpChunk {
         }
 
         this.offline = false;
-        this.dispatch('online');
+        this.eventDispatcher.dispatch('online');
         this.sendChunks();
       });
 
       window.addEventListener('offline', () => {
         this.offline = true;
-        this.dispatch('offline');
+        this.eventDispatcher.dispatch('offline');
       });
     }
   }
@@ -314,21 +301,21 @@ export class UpChunk {
    * Subscribe to an event
    */
   public on(eventName: EventName, fn: (event: CustomEvent) => void) {
-    this.eventTarget.addEventListener(eventName, fn as EventListener);
+    this.eventDispatcher.eventTarget.addEventListener(eventName, fn as EventListener);
   }
 
   /**
    * Subscribe to an event once
    */
   public once(eventName: EventName, fn: (event: CustomEvent) => void) {
-    this.eventTarget.addEventListener(eventName, fn as EventListener, { once: true });
+    this.eventDispatcher.eventTarget.addEventListener(eventName, fn as EventListener, { once: true });
   }
 
   /**
    * Unsubscribe to an event
    */
   public off(eventName: EventName, fn: (event: CustomEvent) => void) {
-    this.eventTarget.removeEventListener(eventName, fn as EventListener);
+    this.eventDispatcher.eventTarget.removeEventListener(eventName, fn as EventListener);
   }
 
   public get paused() {
@@ -350,17 +337,6 @@ export class UpChunk {
 
       this.sendChunks();
     }
-  }
-
-  /**
-   * Dispatch an event
-   */
-  private dispatch(eventName: EventName, detail?: any) {
-    const event: UpchunkEvent = new CustomEvent(eventName, {
-      detail,
-    }) as UpchunkEvent;
-
-    this.eventTarget.dispatchEvent(event);
   }
 
   /**
@@ -464,7 +440,7 @@ export class UpChunk {
         const currentChunkProgress =
           event.loaded / (event.total ?? this.chunkByteSize);
         const chunkPercentage = currentChunkProgress * percentagePerChunk;
-        this.dispatch(
+        this.eventDispatcher.dispatch(
           'progress',
           Math.min((successfulPercentage + chunkPercentage) * 100, 100)
         );
@@ -497,7 +473,7 @@ export class UpChunk {
       'Content-Range': `bytes ${rangeStart}-${rangeEnd}/${this.file.size}`,
     };
 
-    this.dispatch('attempt', {
+    this.eventDispatcher.dispatch('attempt', {
       chunkNumber: this.chunkCount,
       totalChunks: this.totalChunks,
       chunkSize: this.chunkSize,
@@ -519,7 +495,7 @@ export class UpChunk {
       const lastChunkInterval =
         (lastChunkEnd.getTime() - this.lastChunkStart.getTime()) / 1000;
 
-      this.dispatch('chunkSuccess', {
+      this.eventDispatcher.dispatch('chunkSuccess', {
         chunk: this.chunkCount,
         chunkSize: this.chunkSize,
         attempts: this.attemptCount,
@@ -553,7 +529,7 @@ export class UpChunk {
     // What to do if a chunk upload failed, potentially after retries
     const failedChunkUploadCb = async (res: XhrResponse, _chunk?: Blob) => {
       // Side effects
-      this.dispatch('error', {
+      this.eventDispatcher.dispatch('error', {
         message: `Server responded with ${
           (res as XhrResponse).statusCode
         }. Stopping upload.`,
@@ -571,7 +547,7 @@ export class UpChunk {
       _chunk?: Blob
     ) => {
       // Side effects
-      this.dispatch('attemptFailure', {
+      this.eventDispatcher.dispatch('attemptFailure', {
         message: `An error occured uploading chunk ${this.chunkCount}. ${
           this.attempts - this.attemptCount
         } retries left.`,
@@ -630,7 +606,7 @@ export class UpChunk {
       this.pendingChunk = undefined;
       const chunkUploadSuccess = await this.sendChunkWithRetries(chunk);
       if (this.success && chunkUploadSuccess) {
-        this.dispatch('success');
+        this.eventDispatcher.dispatch('success');
       }
     }
 
@@ -647,7 +623,7 @@ export class UpChunk {
       // specifically for "pending chunk" cases for the last chunk.
       this.success = !!done;
       if (this.success && chunkUploadSuccess) {
-        this.dispatch('success');
+        this.eventDispatcher.dispatch('success');
       }
       if (!chunkUploadSuccess) {
         return;
